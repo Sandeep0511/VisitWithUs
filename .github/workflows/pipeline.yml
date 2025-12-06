@@ -1,0 +1,149 @@
+name: MLOps Pipeline - Train, Evaluate & Publish
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: visitwithus-mlops-pipeline
+  cancel-in-progress: false
+
+jobs:
+  build-train-deploy:
+    runs-on: ubuntu-latest
+    env:
+      HF_USERNAME: ${{ secrets.HF_USERNAME }}
+      MODEL_FILE: outputs/model_random_forest_small.pkl
+      NOTEBOOK_TIMEOUT: 1800
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pre-check repository contents
+        run: |
+          echo "Listing repo root:"
+          ls -la
+          if [ ! -f "notebook.ipynb" ]; then
+            echo "ERROR: notebook.ipynb not found!"
+            exit 1
+          fi
+          mkdir -p outputs
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install jupyter nbconvert huggingface_hub
+
+      - name: Execute Notebook (end-to-end pipeline)
+        run: |
+          echo "Executing notebook.ipynb..."
+          jupyter nbconvert             --to notebook             --execute notebook.ipynb             --ExecutePreprocessor.timeout=${NOTEBOOK_TIMEOUT}             --output notebook.ipynb
+
+      - name: Verify outputs directory
+        run: |
+          echo "Outputs directory:"
+          ls -la outputs || true
+
+      - name: Upload model to Hugging Face Model Hub
+        if: ${{ secrets.HF_TOKEN != '' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+        run: |
+          echo "Uploading model to HF model hub..."
+          if [ ! -f "${MODEL_FILE}" ]; then
+            echo "ERROR: Model file not found at ${MODEL_FILE}"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+import os
+from huggingface_hub import create_repo, upload_file
+
+HF_TOKEN = os.environ["HF_TOKEN"]
+HF_USERNAME = os.environ["HF_USERNAME"]
+MODEL_FILE = os.environ["MODEL_FILE"]
+
+repo_id = f"{HF_USERNAME}/visitwithus-wellness-model"
+create_repo(repo_id=repo_id, token=HF_TOKEN, repo_type="model", exist_ok=True)
+
+upload_file(
+    path_or_fileobj=MODEL_FILE,
+    path_in_repo="model.pkl",
+    repo_id=repo_id,
+    repo_type="model",
+    token=HF_TOKEN
+)
+
+# Write & upload a simple model card
+card = "# VisitWithUs - Wellness Purchase Model
+Uploaded via GitHub Actions."
+with open("model_card_README.md", "w") as f:
+    f.write(card)
+
+upload_file(
+    path_or_fileobj="model_card_README.md",
+    path_in_repo="README.md",
+    repo_id=repo_id,
+    repo_type="model",
+    token=HF_TOKEN
+)
+
+print("Model uploaded successfully:", f"https://huggingface.co/{repo_id}")
+PY
+
+      - name: Commit and push generated artifacts back to main
+        # Use the automatically provided GITHUB_TOKEN (via actions/checkout) to push changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git status --porcelain
+          # Configure git user
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Add outputs and notebook (if updated) to commit
+          git add outputs || true
+          git add notebook.ipynb || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "CI: commit trained model & artifacts from workflow run [skip ci]" || true
+            # push back to main using the provided GITHUB_TOKEN
+            git push origin HEAD:main
+          fi
+
+      - name: Create a workflow summary (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visitwithus-pipeline-outputs
+          path: |
+            outputs/*
+            notebook.ipynb
+            model_card_README.md
+
+      - name: Notify completion
+        run: |
+          echo "Pipeline finished. Artifacts saved to outputs/ and model published to Hugging Face (if HF_TOKEN provided)."
